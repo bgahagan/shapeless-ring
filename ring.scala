@@ -1,9 +1,8 @@
-object Ring {
+package ring {
 
   import shapeless._
   import record._
   import ops.hlist.{ ZipWithKeys }
-  import syntax.singleton._
   import ops.record.{ Keys, Values, SelectAll, Merger }
 
   @annotation.implicitNotFound(msg = "Not all field for ${CC} in record ${R}")
@@ -25,63 +24,85 @@ object Ring {
       }
   }
 
-  implicit class RecOps[R <: HList](rec: R) {
-    def toCaseClass[CC](implicit narrow: NarrowToCaseClass[R, CC]) = narrow(rec)
+  @annotation.implicitNotFound(msg = "Not all field for ${A} in record ${Req}")
+  trait Handler[A, B, Req <: HList] extends DepFn2[Req, A => B] with Serializable { 
+    type Out <: HList
+  }
+  object Handler {
+    type Aux[A, B, Req <: HList, Rsp <: HList] = Handler[A, B, Req] { type Out = Rsp }
+    def apply[A, B, Req <: HList](implicit hl: Handler[A, B, Req]): Aux[A, B, Req, hl.Out] = hl
 
-    def mapFn[A, B, T <: HList](fn: A => B)(
-      implicit genB: LabelledGeneric.Aux[B, T],
-      narrow: NarrowToCaseClass[R , A],
-      merger: Merger[R, T]) = {
-      val result = fn(narrow(rec))
-      rec.merge(genB.to(result))
+    implicit def handler[A, B, Req <: HList, Rsp <: HList](
+      implicit 
+      genB: LabelledGeneric.Aux[B, Rsp],
+      narrow: NarrowToCaseClass[Req, A]): Aux[A, B, Req, genB.Repr] = 
+      new Handler[A, B, Req] {
+        type Out = genB.Repr
+        def apply(req: Req, f: A => B): Out = {
+          val a : A = narrow(req)
+          val b: B = f(a)
+          genB.to(b)
+        }
+      }
+  }
+
+  @annotation.implicitNotFound(msg = "Not all field for ${A} in record ${In}")
+  trait TransformWithMerge[A, B, In <: HList] extends DepFn2[In, A => B] with Serializable { type Out <: HList }
+  object TransformWithMerge {
+    type Aux[A, B, In <: HList, Out0 <: HList] = TransformWithMerge[A, B, In] { type Out = Out0 }
+    def apply[A, B, In <: HList](implicit twm: TransformWithMerge[A, B, In]): Aux[A, B, In, twm.Out] = twm
+
+    implicit def transformWithMerge[A, B, In <: HList, Out0 <: HList](
+      implicit 
+      genB: LabelledGeneric.Aux[B, Out0],
+      narrow: NarrowToCaseClass[In, A],
+      merger: Merger[In, Out0]): Aux[A, B, In, merger.Out] = 
+      new TransformWithMerge[A, B, In] {
+        type Out = merger.Out
+        def apply(in: In, f: A => B): Out = {
+          val a : A = narrow(in)
+          val b: B = f(a)
+          in.merge(genB.to(b))
+        }
+      }
+  }
+
+  trait Chain[In] extends DepFn1[In] with Serializable { type Out }
+  object Chain {
+    type Aux[In, Out0] = Chain[In] { type Out = Out0 }
+    def apply[T](
+      implicit gen: LabelledGeneric[T]
+      ): Chain.Aux[gen.Repr, gen.Repr] = 
+        new Chain[gen.Repr] {
+          type Out = gen.Repr
+          def apply(in: gen.Repr): gen.Repr = in
+        }
+
+    implicit class ChainOps[In <: HList, Out <: HList](c: Chain.Aux[In, Out]) {
+      def transform[A, B, NewOut <: HList](f: A => B)(
+        implicit twm: TransformWithMerge.Aux[A, B, Out, NewOut]): Chain.Aux[In, twm.Out] = 
+          new Chain[In] {
+            type Out = twm.Out
+            def apply(in: In): twm.Out =
+              twm(c(in), f)
+          }
+
+      def handle[A, B, Rsp <: HList](f: A => B)(
+        implicit handler: Handler.Aux[A, B, Out, Rsp]): Chain.Aux[In, handler.Out] = 
+          new Chain[In] {
+            type Out = handler.Out
+            def apply(in: In): handler.Out =
+              handler(c(in), f)
+          }
+
+      def build[T](
+        implicit gen: LabelledGeneric.Aux[T, In]): Chain.Aux[T, Out] = 
+          new Chain[T] {
+            type Out = c.Out
+            def apply(in: T): Out =
+              c(gen.to(in))
+          }
     }
   }
 
-  trait Handler[Req <: HList, Rsp <: HList] {
-    def apply(req: Req): Rsp
-  }
-
-  trait Middleware[Req, NextReq, NextRsp, Rsp] {
-    def apply(req: Req, next: Handler[NextReq, NextRsp]): Rsp
-
-    def handle[ReqR <: HList, RspR <: HList, N <: Handler ](req: ReqR, next: H) : RespR = {
-      req.mapFn(
-
-    }
-  }
-
-  case class ReqWithHeaders(headers: List[(String, String)])
-  case class ReqWithCookies(cookies: List[String])
-  case class RspWithCookies(cookies: List[String])
-  case class RspWithHeaders(headers: List[(String, String)])
-
-  class WithCookies extends Handler[ReqWithHeaders, ReqWithCookies, RspWithCookies, RspWithHeaders] {
-    def apply(req: ReqWithHeaders, next: ReqWithCookies => RspWithCookies) : RspWithHeaders = {
-      var rsp = next(ReqWithCookies(req.headers.map{_._2}))
-      RspWithHeaders(Nil)
-    }
-  }
-
-  /*case class MyAppReq(path: String, cookies: List[String])
-  def myApp(req: MyAppReq) = {
-    Response(path + " " + rq.cookies.mkString(","))
-  }*/
-
-  case class Request(path: String, headers: List[(String, String)])
-  case class Response(body: String)
-
-  def main(args: Array[String]) = {
-    val reqGen = LabelledGeneric[Request]
-    val req = Request("/test", "a" -> "b" :: Nil)
-    val rec = reqGen.to(req)
-
-    /*rec
-      .mapFn(parseCookies)
-      .mapFn(myApp)
-
-    val respGen = LabelledGeneric[Response]
-    val resp = 
-    println(resp.body)*/
-
-  }
 }
